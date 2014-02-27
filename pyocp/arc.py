@@ -82,7 +82,7 @@ class arc(object):
         func_list = [i for i in self._funcs]
 
         for v in bounds:
-            syms = v.atoms(Symbol)
+            syms = v.atoms(Symbol) - {self._time,}
             pararg_list += [i for i in syms if i not in pararg_list]
 
             bad = v.atoms(AppliedUndef)
@@ -144,6 +144,47 @@ class arc(object):
             outstr += lead + s + '\n'
         outstr = outstr[:-1]
         return outstr
+
+
+    def _rename_funcs(self, x, append):
+        """
+        Appends names of functions; assumes a matrix is passed in for x.
+        """
+        c = x.T.tolist()[0]
+        for i, v in enumerate(c):
+            t = v.args[0]
+            name = v.func.__name__
+            new_var = time_variables([name + append], t)
+            c[i] = new_var
+        return Matrix(c)
+
+
+    def objective(self, **kwargs):
+        """
+        Provide the objective function for the problem.
+
+        Needs to be in form:
+            J = term + init
+
+        an integral term is not yet supported, and instead needs to be added as
+        a state.
+
+        kwargs to supply are:
+            init : SymPy Expression
+                A SymPy Expression which is made of the states/controls at the
+                initial time; e.g., init = f(x(t_i), u(t_i)).
+            term : SymPy Expression
+                A SymPy Expression which is made of the states/controls at the
+                final time; e.g., init = f(x(t_f), u(t_f)).
+
+        """
+
+        self._obj_init = sympify(0)
+        if 'init' in kwargs:
+            self._obj_init += kwargs['init']
+        self._obj_term = sympify(0)
+        if 'term' in kwargs:
+            self._obj_term += kwargs['term']
 
 
     def odes(self, ode_list=None, specified_list=None):
@@ -254,6 +295,7 @@ class arc(object):
                 flag = 'free'
                 if val[0] == val[1]:
                     flag = 'fixed'
+                self._sanitize_bounds(Matrix(val), 2, v[0])
                 self.__setattr__('_' + v[0], (flag, val[0], val[1]))
             else:
                 self.__setattr__('_' + v[0], ('fixed', v[1], v[1]))
@@ -369,7 +411,16 @@ class arc(object):
 
         if len(kwargs) == 0:
             lead = '      '
+            t = self._time
+            ti = symbols(t.name + '_i')
+            tf = symbols(t.name + '_f')
             print('Definition for ' + self._name + '\n')
+            print('Objective Function')
+            print('  min:')
+            obj_i = self._obj_init.subs(t, ti)
+            obj_f = self._obj_term.subs(t, tf)
+            print(lead + str(obj_i + obj_f))
+            print('')
             print('Quantities')
             print('  states:')
             print(lead + str([i for i in self._states]))
@@ -415,6 +466,198 @@ class arc(object):
                 print(self._print_bounds(self._g_l, self._g, self._g_u, lead))
         else:
             pass
+
+
+    def numerical_defs(self, m, args=None, time_grid=None):
+        """
+        Place to provide some numerical solution defitions of the arc.
+
+        Arguements are:
+            m : int
+                The number of time points in the arc.
+            args : dict
+                A mapping of which symbols (not variables) in the equations
+                from symbol to number.
+            time_grid : iteratable
+                An iterable over the interval (0, 1) which is used for a
+                non-uniform time grid. Needs to have a length of m. If not
+                provided, a uniform time grid is used.
+        """
+
+        if not time_grid:
+            self._time_grid = []
+            for i in range(m):
+                self._time_grid += [i / m]
+        else:
+            if len(time_grid) != m:
+                raise Exception("Length of time_grid does not equal m")
+            self._time_grid = []
+            i = time_grid[0]
+            f = time_grid[-1]
+            s = f - i
+            for j in time_grid:
+                self._time_grid += [j / s - i]
+
+        self._m = m
+
+        if args:
+            for i in args:
+                if float(args[i]) != args[i]:
+                    raise Exception("Non-float values supplied as an argument")
+            params_args = set(self._params_args)
+            arg_keys = set(args.keys())
+            arg_vals = set(args.values())
+            self._params = Matrix(list(params_args - arg_keys))
+            self._args = Matrix(list(arg_keys))
+            self._args_vals = args
+        else:
+            self._params = self._params_args
+            self._args = Matrix([])
+            self._args_vals = dict()
+
+
+    def generate_funcs(self):
+        """
+        Generates functions for the NLP solver.
+
+        Right now, only works for IPOPT, producing sparse matrices, and does so
+        in a slow fashion (Python, not C).
+        """
+
+        states = self._states
+        controls = self._controls
+        params = self._params
+        args = self._args
+        odes = self._odes
+        g = self._g
+
+        n = len(states)
+        m = self._m
+        t = self._time
+        ng = len(self._g)
+
+        if self._t_i[0] == 'fixed':
+            ti = self._t_i[1]
+        else:
+            ti = symbols(self._time.name + '_i')
+        if self._t_f[0] == 'fixed':
+            tf = self._t_f[1]
+        else:
+            tf = symbols(self._time.name + '_f')
+
+        t_points = self._time_grid
+        scale = tf - ti
+        for i in range(m):
+            t_points[i] = ti + scale * t_points[i]
+
+        dt_points = []
+        for i in range(m - 1):
+            dt_points += [(t_points[i] + t_points[i + 1]) / 2]
+
+        x = []
+        for i in range(m):
+            for j in states:
+                x += [j.subs(t, t_points[i])]
+            for j in controls:
+                x += [j.subs(t, t_points[i])]
+        for i in params:
+            x += [i]
+
+        X = DeferredVector('X')
+        to_num = dict(zip(x, X))
+        to_num.update(self._args_vals)
+
+        # Getting the objective function
+        obj = (self._obj_init.subs(zip(states, states.subs(t, t_points[0]))) +
+               self._obj_term.subs(zip(states, states.subs(t, t_points[-1]))))
+        obj_num = obj.subs(to_num)
+        f = lambdify(X, obj_num)
+
+        # Getting the gradient of the objective function
+        present = [i._num for i in obj_num.atoms(DeferredSymbol)]
+        ret = []
+        for i in present:
+            ret += [lambdify(X, obj_num.diff(X[i]))]
+        def f_x(x):
+            f_x = np.zeros(len(x))
+            for i, v in enumerate(present):
+                f_x[v] = ret[i](x)
+            return f_x
+
+        # Getting the constraint function
+        initial = self._initial.subs(t, t_points[0])
+        terminal =self._terminal.subs(t, t_points[-1])
+        init_lam = [lambdify(X, i.subs(to_num)) for i in initial]
+        term_lam = [lambdify(X, i.subs(to_num)) for i in terminal]
+
+        L = DeferredVector('L')
+        local_num = dict(zip(states.T.tolist()[0] +
+                             controls.T.tolist()[0] + list(params) + [t], L))
+        local_num.update(self._args_vals)
+        g_lam = [lambdify(L, i.subs(local_num)) for i in g]
+
+        dt = symbols('dt')
+        t_l = symbols(t.name + '_l')
+        t_r = symbols(t.name + '_r')
+        y_0 = self._rename_funcs(states, '_0').subs(t, t_l)
+        y_1 = self._rename_funcs(states, '_1').subs(t, t_r)
+        u_0 = self._rename_funcs(controls, '_0').subs(t, t_l)
+        u_1 = self._rename_funcs(controls, '_1').subs(t, t_r)
+        f_0 = odes.subs(list(zip(states, y_0)) + list(zip(controls, u_0))).subs(t, t_l)
+        f_1 = odes.subs(list(zip(states, y_1)) + list(zip(controls, u_1))).subs(t, t_r)
+        y_c = (y_0 + y_1) / 2 + dt / 8 * (f_0 - f_1)
+        u_c = (u_0 + u_1) / 2
+        t_c = (t_l + t_r) / 2
+        defect = y_0 - y_1 - dt / 6 * (f_1 + f_0 + 4 *
+                                       odes.subs(list(zip(states, y_c)) +
+                                                 list(zip(controls, u_c))).subs(t, t_c))
+        D = DeferredVector('D')
+        defect_num = dict(zip(list(y_0) + list(u_0) + list(y_1) + list(u_1) +
+                             list(params) + [t_l, t_r] + [dt], D))
+        defect_num.update(self._args_vals)
+        d_lam = [lambdify(D, i.subs(defect_num)) for i in defect]
+
+        t_lam = lambdify(X, Matrix(t_points).subs(to_num).T.tolist()[0])
+        dt_lam = lambdify(X, Matrix(dt_points).subs(to_num).T.tolist()[0])
+        # c has structure init, g, d, g, d, g, d, g, term - where init is
+        # intial constraints, term is terminal constraints, g are the path
+        # constraints, and d are the defects
+
+        def c(x):
+            t_local = t_lam(x)
+            dt_local = dt_lam(x)
+            c = np.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
+            i = 0
+            for j in init_lam:
+                c[i] = j(x)
+                i += 1
+            for j in range(m - 1):
+                local_len = len(states) + len(controls)
+                local = (list(x[j * local_len : (j + 1) * local_len]) +
+                         list(x[-len(params):]) + [t_local[j]])
+                for k in g_lam:
+                    c[i] = k(local)
+                    i += 1
+                d_local = (list(x[j * local_len : (j + 2) * local_len]) +
+                           list(x[-len(params):]) + t_local[j : j + 2] +
+                           [dt_local[j]])
+                for k in d_lam:
+                    c[i] = k(d_local)
+                    i += 1
+            local_len = len(states) + len(controls)
+            local = (list(x[(m - 1) * local_len : m * local_len]) +
+                     list(x[-len(params):]) + [t_points[j]])
+            for k in g_lam:
+                c[i] = k(local)
+                i += 1
+            for j in term_lam:
+                c[i] = j(x)
+                i += 1
+            return c
+
+
+        return f, f_x, c
+
 
 
 
