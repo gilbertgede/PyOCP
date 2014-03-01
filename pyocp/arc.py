@@ -171,11 +171,11 @@ class arc(object):
 
         kwargs to supply are:
             init : SymPy Expression
-                A SymPy Expression which is made of the states/controls at the
-                initial time; e.g., init = f(x(t_i), u(t_i)).
+                A SymPy Expression which is made of the states/controls/time at
+                the initial time; e.g., init = f(x(t_i), u(t_i)).
             term : SymPy Expression
-                A SymPy Expression which is made of the states/controls at the
-                final time; e.g., init = f(x(t_f), u(t_f)).
+                A SymPy Expression which is made of the states/controls/time at
+                the final time; e.g., term = f(x(t_f), u(t_f)).
 
         """
 
@@ -203,7 +203,8 @@ class arc(object):
 
         allvars_set = set()
         state_set = set()
-        der_set = set()
+        state_list = []
+        der_list = []
         funcs_set = set()
         params_set = set()
 
@@ -217,11 +218,18 @@ class arc(object):
             varss = [i for i in ode.atoms(AppliedUndef) if i.args==(t,)]
             allvars_set.update(varss)
             ders = [i for i in ode.atoms(Derivative) if i.expr in allvars_set]
-            der_set.update(ders)
-        for v in der_set:
+            if len(ders) > 1:
+                raise Exception('ODEs are not in first order form')
+            der_list += ders
+        for v in der_list:
             if v.expr in allvars_set:
+                state_list += [v.expr]
                 state_set.update([v.expr])
-        self._states = Matrix(list(state_set))
+        # sorting list of states to be in order ode's were provided in
+        for ode in ode_list:
+            ders = [i for i in ode.atoms(Derivative) if i.expr in allvars_set]
+
+        self._states = Matrix(state_list)
         self._state_ders = self._states.diff(t)
 
         odes = []
@@ -229,7 +237,7 @@ class arc(object):
             ode = [o for o in ode_list if der in o][0]
             sign = ode.diff(der)
             if sign == 1:
-                odes += [ode - der]
+                odes += [-1 * (ode - der)]
             elif sign == -1:
                 odes += [ode + der]
             else:
@@ -356,7 +364,7 @@ class arc(object):
                 self.__setattr__('_' + v, Matrix([[]]))
 
         if 'g' in kwargs:
-            val = kwargs['x']
+            val = kwargs['g']
             self._sanitize_bounds(val, len(val), 'g', True)
             self.__setattr__('_g', val)
         else:
@@ -487,7 +495,7 @@ class arc(object):
         if not time_grid:
             self._time_grid = []
             for i in range(m):
-                self._time_grid += [i / m]
+                self._time_grid += [i / (m - 1)]
         else:
             if len(time_grid) != m:
                 raise Exception("Length of time_grid does not equal m")
@@ -524,6 +532,7 @@ class arc(object):
         in a slow fashion (Python, not C).
         """
 
+        t = self._time
         states = self._states
         controls = self._controls
         params = self._params
@@ -532,8 +541,8 @@ class arc(object):
         g = self._g
 
         n = len(states)
+        nu = len(controls)
         m = self._m
-        t = self._time
         ng = len(self._g)
 
         if self._t_i[0] == 'fixed':
@@ -549,10 +558,9 @@ class arc(object):
         scale = tf - ti
         for i in range(m):
             t_points[i] = ti + scale * t_points[i]
-
         dt_points = []
         for i in range(m - 1):
-            dt_points += [(t_points[i] + t_points[i + 1]) / 2]
+            dt_points += [t_points[i + 1] - t_points[i]]
 
         x = []
         for i in range(m):
@@ -566,14 +574,25 @@ class arc(object):
         X = DeferredVector('X')
         to_num = dict(zip(x, X))
         to_num.update(self._args_vals)
+        t_lam = lambdify(X, list(Matrix(t_points).subs(to_num)))
+        dt_lam = lambdify(X, list(Matrix(dt_points).subs(to_num)))
 
+        """
         # Getting the objective function
-        obj = (self._obj_init.subs(zip(states, states.subs(t, t_points[0]))) +
-               self._obj_term.subs(zip(states, states.subs(t, t_points[-1]))))
+        """
+        obj = sympify(0)
+        for i in [(self._obj_init, t_points[0]), (self._obj_term, t_points[-1])]:
+            z = []
+            for v in [states, controls]:
+                z += list(zip(v, v.subs(t, i[1])))
+            obj += i[0].subs(z)
+
         obj_num = obj.subs(to_num)
         f = lambdify(X, obj_num)
 
+        """
         # Getting the gradient of the objective function
+        """
         present = [i._num for i in obj_num.atoms(DeferredSymbol)]
         ret = []
         for i in present:
@@ -584,18 +603,22 @@ class arc(object):
                 f_x[v] = ret[i](x)
             return f_x
 
+        """
         # Getting the constraint function
+        """
+        # Initial/Terminal constraints
         initial = self._initial.subs(t, t_points[0])
         terminal =self._terminal.subs(t, t_points[-1])
         init_lam = [lambdify(X, i.subs(to_num)) for i in initial]
         term_lam = [lambdify(X, i.subs(to_num)) for i in terminal]
 
+        # Used for the path constraints
         L = DeferredVector('L')
-        local_num = dict(zip(states.T.tolist()[0] +
-                             controls.T.tolist()[0] + list(params) + [t], L))
+        local_num = dict(zip(list(states) + list(controls) + list(params) + [t], L))
         local_num.update(self._args_vals)
         g_lam = [lambdify(L, i.subs(local_num)) for i in g]
 
+        # Used for the defects
         dt = symbols('dt')
         t_l = symbols(t.name + '_l')
         t_r = symbols(t.name + '_r')
@@ -608,48 +631,47 @@ class arc(object):
         y_c = (y_0 + y_1) / 2 + dt / 8 * (f_0 - f_1)
         u_c = (u_0 + u_1) / 2
         t_c = (t_l + t_r) / 2
-        defect = y_0 - y_1 - dt / 6 * (f_1 + f_0 + 4 *
+        defect = y_1 - y_0 - dt / 6 * (f_1 + f_0 + 4 *
                                        odes.subs(list(zip(states, y_c)) +
                                                  list(zip(controls, u_c))).subs(t, t_c))
         D = DeferredVector('D')
         defect_num = dict(zip(list(y_0) + list(u_0) + list(y_1) + list(u_1) +
-                             list(params) + [t_l, t_r] + [dt], D))
+                              list(params) + [t_l, t_r] + [dt], D))
         defect_num.update(self._args_vals)
         d_lam = [lambdify(D, i.subs(defect_num)) for i in defect]
 
-        t_lam = lambdify(X, Matrix(t_points).subs(to_num).T.tolist()[0])
-        dt_lam = lambdify(X, Matrix(dt_points).subs(to_num).T.tolist()[0])
         # c has structure init, g, d, g, d, g, d, g, term - where init is
         # intial constraints, term is terminal constraints, g are the path
         # constraints, and d are the defects
 
         def c(x):
+            c = np.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
+            # make time grid, dt grid - done here in case there is any time
+            # dependence on parameters (e.g. free final time)
             t_local = t_lam(x)
             dt_local = dt_lam(x)
-            c = np.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
+            if len(params) == 0:
+                pars = []
+            else:
+                pars = list(x[-len(params):])
+            # Fill the return vector
             i = 0
             for j in init_lam:
                 c[i] = j(x)
                 i += 1
-            for j in range(m - 1):
-                local_len = len(states) + len(controls)
-                local = (list(x[j * local_len : (j + 1) * local_len]) +
-                         list(x[-len(params):]) + [t_local[j]])
+            for j in range(m):
+                local = (list(x[j * (n + nu) : (j + 1) * (n + nu)]) +
+                         pars + [t_local[j]])
                 for k in g_lam:
                     c[i] = k(local)
                     i += 1
-                d_local = (list(x[j * local_len : (j + 2) * local_len]) +
-                           list(x[-len(params):]) + t_local[j : j + 2] +
-                           [dt_local[j]])
+                if j == m - 1:      # if we're at the last time point, no
+                    break           # defects are computed...
+                d_local = (list(x[j * (n + nu) : (j + 2) * (n + nu)]) +
+                           pars + t_local[j : j + 2] + [dt_local[j]])
                 for k in d_lam:
                     c[i] = k(d_local)
                     i += 1
-            local_len = len(states) + len(controls)
-            local = (list(x[(m - 1) * local_len : m * local_len]) +
-                     list(x[-len(params):]) + [t_points[j]])
-            for k in g_lam:
-                c[i] = k(local)
-                i += 1
             for j in term_lam:
                 c[i] = j(x)
                 i += 1
