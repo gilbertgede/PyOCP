@@ -24,14 +24,6 @@ class arc(object):
             Symbolic quantities which are only symbols. Will _NOT_ be
             considered "free" to be optimized. Must instead have a numerical
             value supplied at some point.
-        specified
-            Symbolic quantities which are only functions of time and represent
-            quantities which are not states, not controls, and are prescribed
-            ahead of time; e.g. position of planetary bodies as a function of
-            time.  It is assumed that these will be later supplied as:
-            numerical functions, or sympy expressions.
-        functions
-            Symbolic quantities which can be functions of time, states,
             controls, specified, parameters, arguments, etc. Needs to be
             either later supplied as: numerical functions, or sympy
             expressions.
@@ -77,7 +69,6 @@ class arc(object):
                             str(n) + 'x1.')
 
         # first checking to make sure no states/controls are in the bounds
-        spec_list = [i for i in self._specified]
         pararg_list = [i for i in self._params_args]
         func_list = [i for i in self._funcs]
 
@@ -93,15 +84,9 @@ class arc(object):
                                         'controls or functions.')
                 else:
                     if not ((b in self._states) or (b in self._controls) or
-                            (b in self._specs)):
-                        if b.free_symbols == set([self._time]):
-                            if b not in spec_list:
-                                spec_list += [b]
-                        else:
-                            if b not in func_list:
-                                func_list += [b]
+                            (b.func in func_list)):
+                        func_list += [b.func]
 
-        self._specified = Matrix(spec_list)
         self._params_args = Matrix(pararg_list)
         self._funcs = Matrix(func_list)
 
@@ -205,14 +190,13 @@ class arc(object):
         state_set = set()
         state_list = []
         der_list = []
-        funcs_set = set()
         params_set = set()
 
         if specified_list:
-            spec_set = list(specified_list)
+            funcs_set = list(specified_list)
         else:
-            spec_set = set()
-        self._specified = Matrix(list(spec_set))
+            funcs_set = set()
+
 
         for ode in ode_list:
             varss = [i for i in ode.atoms(AppliedUndef) if i.args==(t,)]
@@ -244,11 +228,11 @@ class arc(object):
                 raise Exception("Invalid format for ODE")
         self._odes = Matrix(odes)
 
-        controls_set = allvars_set - state_set - spec_set
+        controls_set = allvars_set - state_set - funcs_set
         self._controls = Matrix(list(controls_set))
 
         for ode in ode_list:
-            funcs = [i for i in ode.atoms(AppliedUndef) if i.args!=(t,)]
+            funcs = [i.func for i in ode.atoms(AppliedUndef) if i.args!=(t,)]
             funcs_set.update(funcs)
         self._funcs = Matrix(list(funcs_set))
 
@@ -331,16 +315,15 @@ class arc(object):
         Valid keyword arguments are:
             initial : list
                 A list of constraint equations for t=t_i. Can be function of
-                states, controls, parameters, and specifieds.
+                states, controls, parameters, and functions.
             terminal : list
                 A list of constraint equations for t=t_f. Can be function of
-                states, controls, parameters, and specifieds.
+                states, controls, parameters, and functions.
             g : SymPy Matrix
                 A SymPy matrix containing equality constraint expressions
                 (requires g_l, g_u to be supplied). For equality constraints,
                 set the appropriate entries in g_l, g_u to be equal.  Can be
-                functions of parameters, time, states, controls, specified
-                functions, and external functions.
+                functions of parameters, time, states, controls, and functions.
             g_l : SymPy Matrix
                 Represents lower bounds on path constraints. Should be a SymPy
                 Matrix of m x 1, where m is the number of inequality constraint
@@ -388,7 +371,6 @@ class arc(object):
     At this point, the following have been defined:
         _states
         _controls
-        _specified
         _funcs
         _odes
         _t_i
@@ -434,8 +416,6 @@ class arc(object):
             print(lead + str([i for i in self._states]))
             print('  controls:')
             print(lead + str([i for i in self._controls]))
-            print('  specifieds:')
-            print(lead + str([i for i in self._specified]))
             print('  functions:')
             print(lead + str([i for i in self._funcs]))
             print('  parameters and arguments:')
@@ -476,7 +456,7 @@ class arc(object):
             pass
 
 
-    def numerical_defs(self, m, args=None, time_grid=None):
+    def numerical_defs(self, m, args=None, time_grid=None, func_dict={}):
         """
         Place to provide some numerical solution defitions of the arc.
 
@@ -486,10 +466,16 @@ class arc(object):
             args : dict
                 A mapping of which symbols (not variables) in the equations
                 from symbol to number.
-            time_grid : iteratable
+            time_grid : iterable
                 An iterable over the interval (0, 1) which is used for a
                 non-uniform time grid. Needs to have a length of m. If not
                 provided, a uniform time grid is used.
+            func_dict : dictionary
+                A dictionary of (symbolic_function_name, numerical_function)
+                key/values pairs in a Python dictionary. Make sure to only
+                provide the function name, not the function as written (e.g.,
+                f, not f(x)). Assumes a numerical function in the NumPy
+                environment.
         """
 
         if not time_grid:
@@ -523,6 +509,8 @@ class arc(object):
             self._args = Matrix([])
             self._args_vals = dict()
 
+        self._func_dict = dict([(str(i), func_dict[i]) for i in func_dict])
+
 
     def generate_funcs(self):
         """
@@ -538,6 +526,9 @@ class arc(object):
         params = self._params
         args = self._args
         odes = self._odes
+        funcs = self._funcs
+        func_dict = self._func_dict
+        func_names = [i.func for i in funcs]
         g = self._g
 
         n = len(states)
@@ -588,19 +579,43 @@ class arc(object):
             obj += i[0].subs(z)
 
         obj_num = obj.subs(to_num)
-        f = lambdify(X, obj_num)
+        f = lambdify(X, obj_num, func_dict)
 
         """
         # Getting the gradient of the objective function
         """
         present = [i._num for i in obj_num.atoms(DeferredSymbol)]
-        ret = []
+        present.sort()
+        obj_diffed = []
         for i in present:
-            ret += [lambdify(X, obj_num.diff(X[i]))]
+            obj_diffed += [obj_num.diff(X[i])]
+        # identify present derivatives
+        ders = dict()
+        varss = dict()
+        for o in obj_diffed:
+            o_atoms = o.atoms(Derivative)
+            temp = [d.expr for d in o_atoms]
+            ders.update(zip(o_atoms, temp))
+            varss.update(zip(o_atoms, [d.variables[0] for d in o_atoms]))
+        # create lambdified functions for derivatives
+        D_func = DeferredVector('D_func')
+        D_func_list = []
+        for d in ders:
+            D_func_list += [lambdify(X, num_diff(func_dict[str(ders[d].func)], ders[d].args, ders[d].args.index(varss[d])))]
+        D_func_dict = dict(zip(ders.keys(), D_func))
+        # lambdification of nonzero entries of object gradient
+        ret = []
+        for i in obj_diffed:
+            ret += [lambdify((X, D_func), i.subs(D_func_dict), func_dict)]
+        # actual function to return
         def f_x(x):
+            n_D_funcs = len(D_func_list)
+            d = np.zeros(n_D_funcs)
+            for i in range(n_D_funcs):
+                d[i] = D_func_list[i](x)
             f_x = np.zeros(len(x))
             for i, v in enumerate(present):
-                f_x[v] = ret[i](x)
+                f_x[v] = ret[i](x, d)
             return f_x
 
         """
@@ -616,7 +631,7 @@ class arc(object):
         L = DeferredVector('L')
         local_num = dict(zip(list(states) + list(controls) + list(params) + [t], L))
         local_num.update(self._args_vals)
-        g_lam = [lambdify(L, i.subs(local_num)) for i in g]
+        g_lam = [lambdify(L, i.subs(local_num), func_dict) for i in g]
 
         # Used for the defects
         dt = symbols('dt')
@@ -638,7 +653,7 @@ class arc(object):
         defect_num = dict(zip(list(y_0) + list(u_0) + list(y_1) + list(u_1) +
                               list(params) + [t_l, t_r] + [dt], D))
         defect_num.update(self._args_vals)
-        d_lam = [lambdify(D, i.subs(defect_num)) for i in defect]
+        d_lam = [lambdify(D, i.subs(defect_num), func_dict) for i in defect]
 
         # c has structure init, g, d, g, d, g, d, g, term - where init is
         # intial constraints, term is terminal constraints, g are the path
@@ -679,8 +694,6 @@ class arc(object):
 
 
         return f, f_x, c
-
-
 
 
 
