@@ -40,15 +40,9 @@ class arc(object):
         """
 
         self._number = number
-        if isinstance(time_symbol, Symbol):
-            self._time = time_symbol
-        else:
-            raise Exception("Invalid time symbol supplied (use SymPy's symbol)")
+        self._time = sympify(time_symbol)
         if name:
-            if isinstance(name, str):
-                self._name = name
-            else:
-                raise Exception("Invalid name supplied")
+            self._name = name
         else:
             self._name = "Arc " + str(number)
 
@@ -94,6 +88,8 @@ class arc(object):
     def _print_bounds(self, l, x, u, lead):
         """
         Just used for some prettier printing.
+
+        e.g.
 
           0  <=  x(t)  <=      1
          10  <=  y(t)  <=  v * 2
@@ -196,7 +192,6 @@ class arc(object):
             funcs_set = list(specified_list)
         else:
             funcs_set = set()
-
 
         for ode in ode_list:
             varss = [i for i in ode.atoms(AppliedUndef) if i.args==(t,)]
@@ -411,47 +406,38 @@ class arc(object):
             obj_f = self._obj_term.subs(t, tf)
             print(lead + str(obj_i + obj_f))
             print('')
+
             print('Quantities')
-            print('  states:')
-            print(lead + str([i for i in self._states]))
-            print('  controls:')
-            print(lead + str([i for i in self._controls]))
-            print('  functions:')
-            print(lead + str([i for i in self._funcs]))
-            print('  parameters and arguments:')
-            print(lead + str([i for i in self._params_args]))
+            text = ['states', 'controls', 'functions', 'parameters and arguements']
+            vals = [self._states, self._controls, self._funcs, self._params_args]
+            for i in range(len(text)):
+                print('  %s:' % text[i])
+                print(lead + str([v for v in vals[i]]))
             print('')
+
             print('Constraints')
             print('  times:')
-            t_i = self._t_i
-            if t_i[0] == 'fixed':
-                print(lead + 't_i = ' + str(t_i[1]))
-            else:
-                print(lead + str(t_i[1]) + ' ≤ t_i ≤ ' + str(t_i[2]))
-            t_f = self._t_f
-            if t_f[0] == 'fixed':
-                print(lead + 't_f = ' + str(t_f[1]))
-            else:
-                print(lead + str(t_f[1]) + ' ≤ t_f ≤ ' + str(t_f[2]))
+            tees = [(self._t_i, 't_i'), (self._t_f, 't_f')]
+            for t in tees:
+                if t[0][0] == 'fixed':
+                    print(lead + '%s = ' % t[1] + str(t[0][1]))
+                else:
+                    print(lead + str(t[0][1]) + ' ≤ %s ≤ ' % t[1] + str(t_i[2]))
             print('  state bounds:')
             print(self._print_bounds(self._x_l, self._states, self._x_u, lead))
             print('  control bounds:')
             print(self._print_bounds(self._u_l, self._controls, self._u_u, lead))
-            if self._initial != Matrix([[]]):
-                print('  initial conditions:')
-                strs = [str(i) for i in self._initial]
-                l = max([len(i) for i in strs])
-                for s in strs:
-                    print(lead + '0 = ' + '%ls' % s)
-            if self._terminal != Matrix([[]]):
-                print('  terminal conditions:')
-                strs = [str(i) for i in self._terminal]
-                l = max([len(i) for i in strs])
-                for s in strs:
-                    print(lead + '0 = ' + '%ls' % s)
+            init_term = [(self._initial, 'initial conditions'), (self._terminal, 'terminal conditions')]
+            for it in init_term:
+                if it != Matrix([[]]):
+                    print('  %s:' % it[1])
+                    strs = [str(i) for i in it[0]]
+                    for s in strs:
+                        print(lead + '0 = %s' % s)
             if self._g != Matrix([[]]):
                 print('  path constraints:')
                 print(self._print_bounds(self._g_l, self._g, self._g_u, lead))
+            print('')
         else:
             pass
 
@@ -511,6 +497,22 @@ class arc(object):
 
         self._func_dict = dict([(str(i), func_dict[i]) for i in func_dict])
 
+        if self._t_i[0] == 'fixed':
+            ti = self._t_i[1]
+        else:
+            ti = symbols(self._time.name + '_i')
+        if self._t_f[0] == 'fixed':
+            tf = self._t_f[1]
+        else:
+            tf = symbols(self._time.name + '_f')
+
+        t_points = self._time_grid
+        scale = tf - ti
+        for i in range(m):
+            t_points[i] = ti + scale * t_points[i]
+
+        self._t_points = t_points
+
 
     def generate_funcs(self):
         """
@@ -531,28 +533,16 @@ class arc(object):
         func_names = [i.func for i in funcs]
         g = self._g
 
+        t_points = self._t_points
+
         n = len(states)
         nu = len(controls)
         m = self._m
         ng = len(self._g)
+        np = len(params)
 
-        if self._t_i[0] == 'fixed':
-            ti = self._t_i[1]
-        else:
-            ti = symbols(self._time.name + '_i')
-        if self._t_f[0] == 'fixed':
-            tf = self._t_f[1]
-        else:
-            tf = symbols(self._time.name + '_f')
-
-        t_points = self._time_grid
-        scale = tf - ti
-        for i in range(m):
-            t_points[i] = ti + scale * t_points[i]
-        dt_points = []
-        for i in range(m - 1):
-            dt_points += [t_points[i + 1] - t_points[i]]
-
+        # The mapping from sympy to numeric
+        X = DeferredVector('X')
         x = []
         for i in range(m):
             for j in states:
@@ -561,12 +551,10 @@ class arc(object):
                 x += [j.subs(t, t_points[i])]
         for i in params:
             x += [i]
-
-        X = DeferredVector('X')
         to_num = dict(zip(x, X))
         to_num.update(self._args_vals)
+
         t_lam = lambdify(X, list(Matrix(t_points).subs(to_num)))
-        dt_lam = lambdify(X, list(Matrix(dt_points).subs(to_num)))
 
         """
         # Getting the objective function
@@ -590,19 +578,7 @@ class arc(object):
         for i in present:
             obj_diffed += [obj_num.diff(X[i])]
         # identify present derivatives
-        ders = dict()
-        varss = dict()
-        for o in obj_diffed:
-            o_atoms = o.atoms(Derivative)
-            temp = [d.expr for d in o_atoms]
-            ders.update(zip(o_atoms, temp))
-            varss.update(zip(o_atoms, [d.variables[0] for d in o_atoms]))
-        # create lambdified functions for derivatives
-        D_func = DeferredVector('D_func')
-        D_func_list = []
-        for d in ders:
-            D_func_list += [lambdify(X, num_diff(func_dict[str(ders[d].func)], ders[d].args, ders[d].args.index(varss[d])))]
-        D_func_dict = dict(zip(ders.keys(), D_func))
+        D_func, D_func_list, D_func_dict = pull_out_derivatives(obj_diffed, 'D_func', X, func_dict)
         # lambdification of nonzero entries of object gradient
         ret = []
         for i in obj_diffed:
@@ -610,10 +586,10 @@ class arc(object):
         # actual function to return
         def f_x(x):
             n_D_funcs = len(D_func_list)
-            d = np.zeros(n_D_funcs)
+            d = numpy.zeros(n_D_funcs)
             for i in range(n_D_funcs):
                 d[i] = D_func_list[i](x)
-            f_x = np.zeros(len(x))
+            f_x = numpy.zeros(len(x))
             for i, v in enumerate(present):
                 f_x[v] = ret[i](x, d)
             return f_x
@@ -622,8 +598,8 @@ class arc(object):
         # Getting the constraint function
         """
         # Initial/Terminal constraints
-        initial = self._initial.subs(t, t_points[0])
-        terminal =self._terminal.subs(t, t_points[-1])
+        initial  = self._initial.subs(t, t_points[0])
+        terminal = self._terminal.subs(t, t_points[-1])
         init_lam = [lambdify(X, i.subs(to_num)) for i in initial]
         term_lam = [lambdify(X, i.subs(to_num)) for i in terminal]
 
@@ -634,9 +610,9 @@ class arc(object):
         g_lam = [lambdify(L, i.subs(local_num), func_dict) for i in g]
 
         # Used for the defects
-        dt = symbols('dt')
         t_l = symbols(t.name + '_l')
         t_r = symbols(t.name + '_r')
+        dt = t_r - t_l
         y_0 = self._rename_funcs(states, '_0').subs(t, t_l)
         y_1 = self._rename_funcs(states, '_1').subs(t, t_r)
         u_0 = self._rename_funcs(controls, '_0').subs(t, t_l)
@@ -651,49 +627,206 @@ class arc(object):
                                                  list(zip(controls, u_c))).subs(t, t_c))
         D = DeferredVector('D')
         defect_num = dict(zip(list(y_0) + list(u_0) + list(y_1) + list(u_1) +
-                              list(params) + [t_l, t_r] + [dt], D))
-        defect_num.update(self._args_vals)
-        d_lam = [lambdify(D, i.subs(defect_num), func_dict) for i in defect]
+                              list(params) + [t_l, t_r], D))
+        defect = defect.subs(defect_num).subs(self._args_vals)
+        d_lam = [lambdify(D, i, func_dict) for i in defect]
 
         # c has structure init, g, d, g, d, g, d, g, term - where init is
         # intial constraints, term is terminal constraints, g are the path
         # constraints, and d are the defects
 
         def c(x):
-            c = np.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
+            c = numpy.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
             # make time grid, dt grid - done here in case there is any time
             # dependence on parameters (e.g. free final time)
             t_local = t_lam(x)
-            dt_local = dt_lam(x)
+            pars = list(x[-len(params):])
             if len(params) == 0:
                 pars = []
-            else:
-                pars = list(x[-len(params):])
+            locals = []
+            d_locals = []
+            for j in range(m):
+                locals += [(list(x[j * (n + nu) : (j + 1) * (n + nu)]) +
+                            pars + [t_local[j]])]
+                if j == m - 1:
+                    break
+                d_locals += [(list(x[j * (n + nu) : (j + 2) * (n + nu)]) +
+                              pars + t_local[j : j + 2])]
             # Fill the return vector
             i = 0
             for j in init_lam:
                 c[i] = j(x)
                 i += 1
             for j in range(m):
-                local = (list(x[j * (n + nu) : (j + 1) * (n + nu)]) +
-                         pars + [t_local[j]])
                 for k in g_lam:
-                    c[i] = k(local)
+                    c[i] = k(locals[j])
                     i += 1
                 if j == m - 1:      # if we're at the last time point, no
                     break           # defects are computed...
-                d_local = (list(x[j * (n + nu) : (j + 2) * (n + nu)]) +
-                           pars + t_local[j : j + 2] + [dt_local[j]])
                 for k in d_lam:
-                    c[i] = k(d_local)
+                    c[i] = k(d_locals[j])
                     i += 1
             for j in term_lam:
                 c[i] = j(x)
                 i += 1
             return c
 
+        """
+        # Getting the Jacobian of the constraint function
+        """
+        # Initial/Terminal constraints
+        initial = self._initial.subs(t, t_points[0]).subs(to_num)
+        init_rows = []
+        init_cols = []
+        init_lam_j = []
+        present_i = []
+        present_i_diffed = []
+        for i in range(initial.rows):
+            temp = [j._num for j in initial[i].atoms(DeferredSymbol)]
+            temp.sort()
+            present_i += temp
+            for j in range(len(temp)):
+                diff_X = temp[j]
+                init_rows += [i]
+                init_cols += [diff_X]
+                present_i_diffed += [initial[i].diff(X[diff_X])]
+        iD_func, iD_func_list, iD_func_dict = pull_out_derivatives(present_i_diffed, 'iD_func', X, func_dict)
 
-        return f, f_x, c
+        for j in range(len(present_i_diffed)):
+            temp = present_i_diffed[j].subs(iD_func_dict)
+            init_lam_j += [lambdify((X, iD_func), temp, func_dict)]
+
+        terminal = self._terminal.subs(t, t_points[-1]).subs(to_num)
+        term_rows = []
+        term_cols = []
+        term_lam_j = []
+        present_t = []
+        present_t_diffed = []
+        for i in range(terminal.rows):
+            temp = [j._num for j in terminal[i].atoms(DeferredSymbol)]
+            temp.sort()
+            present_t += temp
+            for j in range(len(temp)):
+                diff_X = temp[j]
+                term_rows += [len(initial) + (m - 1) * n + m * ng + i]
+                term_cols += [diff_X]
+                present_t_diffed += [terminal[i].diff(X[diff_X])]
+        tD_func, tD_func_list, tD_func_dict = pull_out_derivatives(present_t_diffed, 'tD_func', X, func_dict)
+
+        for j in range(len(present_t_diffed)):
+            temp = present_t_diffed[j].subs(tD_func_dict)
+            term_lam_j  += [lambdify((X, tD_func), temp, func_dict)]
+
+        # Path constraints
+        D_g = g.subs(self._args_vals).jacobian(list(states) + list(controls) + list(params))
+        gD_func, gD_func_list, gD_func_dict = pull_out_derivatives(D_g, 'gD_func', L, func_dict)
+        # now we have lambdified functions for the numerical derivatives, and a
+        # mapping from their presence in g, to a deferred vector in their place
+        dg_lam = []
+        for i in range(D_g.rows):
+            temp = []
+            for j in range(D_g.cols):
+                temp_subs = D_g[i, j].subs(local_num).subs(gD_func_dict)
+                temp += [lambdify((L, gD_func), temp_subs, func_dict)]
+            dg_lam += [temp]
+
+        # Defect parts
+        defect_list = list(y_0) + list(u_0) + list(y_1) + list(u_1) + list(params)
+        defect_def_syms = [defect_num[i] for i in defect_list]
+        D_defect = defect.jacobian(defect_def_syms)
+
+        dD_func, dD_func_list, dD_func_dict = pull_out_derivatives(D_defect, 'dD_func', D, func_dict)
+        dd_lam = []
+        for i in range(D_defect.rows):
+            temp = []
+            for j in range(D_defect.cols):
+                temp_subs = D_defect[i, j].subs(defect_num).subs(dD_func_dict)
+                temp += [lambdify((D, dD_func), temp_subs, func_dict)]
+            dd_lam += [temp]
+
+        def c_x(x):
+            # output matrix to fill
+            # TODO the * n terms are wrong - they should include the length of
+            # the parameters?
+            rows = numpy.zeros((m - 1) * len(dd_lam) * len(dd_lam[0]) + m * len(dg_lam) * len(dg_lam[0]) + len(init_lam_j) + len(term_lam_j))
+            cols = numpy.zeros((m - 1) * len(dd_lam) * len(dd_lam[0]) + m * len(dg_lam) * len(dg_lam[0])+ len(init_lam_j) + len(term_lam_j))
+            data = numpy.zeros((m - 1) * len(dd_lam) * len(dd_lam[0]) + m * len(dg_lam) * len(dg_lam[0])+ len(init_lam_j) + len(term_lam_j))
+
+            i = 0
+            # initial
+            n_iD_funcs = len(iD_func_list)
+            id = numpy.zeros(n_iD_funcs)
+            for j in range(n_iD_funcs):
+                id[j] = iD_func_list[j](x)
+            for j in range(len(init_lam_j)):
+                temp = init_lam_j[i](x, id)
+                rows[i] = init_rows[j]
+                cols[i] = init_cols[j]
+                data[i] = init_lam_j[j](x, id)
+                i += 1
+            # terminal
+            n_tD_funcs = len(tD_func_list)
+            td = numpy.zeros(n_tD_funcs)
+            for j in range(n_tD_funcs):
+                td[j] = tD_func_list[j](x)
+            for j in range(len(term_lam_j)):
+                rows[i] = term_rows[j]
+                cols[i] = term_cols[j]
+                data[i] = term_lam_j[j](x, td)
+                i += 1
+
+            # make time grid, dt grid - done here in case there is any time
+            # dependence on parameters (e.g. free final time)
+            t_local = t_lam(x)
+            if len(params) == 0:
+                pars = []
+            else:
+                pars = list(x[-len(params):])
+            # Get lists of 'local' (to each time point) states, controls, etc.
+            locals = []
+            d_locals = []
+            for j in range(m):
+                locals += [(list(x[j * (n + nu) : (j + 1) * (n + nu)]) +
+                            pars + [t_local[j]])]
+                if j == m - 1:
+                    break
+                d_locals += [(list(x[j * (n + nu) : (j + 2) * (n + nu)]) +
+                              pars + t_local[j : j + 2])]
+
+            # Fill in the path constraints
+            n_gD_funcs = len(gD_func_list)
+            gd = numpy.zeros((m, n_gD_funcs))
+            for j in range(m):
+                for k in range(n_gD_funcs):
+                    gd[j][k] = gD_func_list[k](locals[j])
+            for j in range(m):
+                for k in range(D_g.rows):
+                    for ii in range(D_g.cols):
+                        rows[i] = len(initial) + j * (D_g.rows + n) + k
+                        cols[i] = j * (n + 1) + ii
+                        data[i] = dg_lam[k][ii](locals[j], gd[j])
+                        i += 1
+                        if ii >= n + nu:
+                            cols[i] = (n + nu) * m + ii
+            # Fill in the defect constraints
+            n_dD_funcs = len(dD_func_list)
+            dd = numpy.zeros((m - 1, n_dD_funcs))
+            for j in range(m - 1):
+                for k in range(n_dD_funcs):
+                    dd[j][k] = dD_func_list[k](d_locals[j])
+            for j in range(m - 1):
+                for k in range(D_defect.rows):
+                    for ii in range(D_defect.cols):
+                        rows[i] = len(initial) + D_g.rows + j * (D_g.rows + n) + k
+                        cols[i] = j * (n + 1) + ii
+                        data[i] = dd_lam[k][ii](d_locals[j], dd[j])
+                        i += 1
+                        if ii >= 2 * (n + nu):
+                            cols[i] = (n + nu) * m + ii
+
+            return rows, cols, data
+
+        return f, f_x, c, c_x
 
 
 

@@ -4,10 +4,10 @@ from sympy import sin, cos, sqrt
 from numpy import array, hstack
 
 # States
-x, v, w = time_variables(['x', 'v', 'w'], t)
+x, v, w = time_variables('x, v, w', t)
 x_d, v_d, w_d = [i.diff(t) for i in [x, v, w]]
 # Controls
-u = time_variables(['u'], t)[0]
+u = time_variables('u', t)
 # Params
 l = symbols('l')
 # ODEs
