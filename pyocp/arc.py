@@ -538,19 +538,14 @@ class arc(object):
         n = len(states)
         nu = len(controls)
         m = self._m
-        ng = len(self._g)
-        np = len(params)
 
         # The mapping from sympy to numeric
         X = DeferredVector('X')
         x = []
         for i in range(m):
-            for j in states:
-                x += [j.subs(t, t_points[i])]
-            for j in controls:
-                x += [j.subs(t, t_points[i])]
-        for i in params:
-            x += [i]
+            x += [j.subs(t, t_points[i]) for j in states]
+            x += [j.subs(t, t_points[i]) for j in controls]
+        x += [i for i in params]
         to_num = dict(zip(x, X))
         to_num.update(self._args_vals)
 
@@ -561,9 +556,7 @@ class arc(object):
         """
         obj = sympify(0)
         for i in [(self._obj_init, t_points[0]), (self._obj_term, t_points[-1])]:
-            z = []
-            for v in [states, controls]:
-                z += list(zip(v, v.subs(t, i[1])))
+            z = [(v, v.subs(t, i[1])) for v in list(states) + list(controls)]
             obj += i[0].subs(z)
 
         obj_num = obj.subs(to_num)
@@ -634,24 +627,19 @@ class arc(object):
         # c has structure init, g, d, g, d, g, d, g, term - where init is
         # intial constraints, term is terminal constraints, g are the path
         # constraints, and d are the defects
-
         def c(x):
-            c = numpy.zeros(len(initial) + m * ng + n * (m - 1) + len(terminal))
+            c = numpy.zeros(len(initial) + m * len(g) + n * (m - 1) + len(terminal))
             # make time grid, dt grid - done here in case there is any time
             # dependence on parameters (e.g. free final time)
             t_local = t_lam(x)
             pars = list(x[-len(params):])
             if len(params) == 0:
                 pars = []
-            locals = []
-            d_locals = []
-            for j in range(m):
-                locals += [(list(x[j * (n + nu) : (j + 1) * (n + nu)]) +
-                            pars + [t_local[j]])]
-                if j == m - 1:
-                    break
-                d_locals += [(list(x[j * (n + nu) : (j + 2) * (n + nu)]) +
-                              pars + t_local[j : j + 2])]
+
+            locals = [(list(x[j * (n + nu) : (j + 1) * (n + nu)]) + pars +
+                       [t_local[j]]) for j in range(m)]
+            d_locals = [(list(x[j * (n + nu) : (j + 2) * (n + nu)]) + pars +
+                         t_local[j : j + 2]) for j in range(m - 1)]
             # Fill the return vector
             i = 0
             for j in init_lam:
@@ -679,12 +667,10 @@ class arc(object):
         init_rows = []
         init_cols = []
         init_lam_j = []
-        present_i = []
         present_i_diffed = []
         for i in range(initial.rows):
             temp = [j._num for j in initial[i].atoms(DeferredSymbol)]
             temp.sort()
-            present_i += temp
             for j in range(len(temp)):
                 diff_X = temp[j]
                 init_rows += [i]
@@ -700,15 +686,13 @@ class arc(object):
         term_rows = []
         term_cols = []
         term_lam_j = []
-        present_t = []
         present_t_diffed = []
         for i in range(terminal.rows):
             temp = [j._num for j in terminal[i].atoms(DeferredSymbol)]
             temp.sort()
-            present_t += temp
             for j in range(len(temp)):
                 diff_X = temp[j]
-                term_rows += [len(initial) + (m - 1) * n + m * ng + i]
+                term_rows += [len(initial) + (m - 1) * n + m * len(g) + i]
                 term_cols += [diff_X]
                 present_t_diffed += [terminal[i].diff(X[diff_X])]
         tD_func, tD_func_list, tD_func_dict = pull_out_derivatives(present_t_diffed, 'tD_func', X, func_dict)

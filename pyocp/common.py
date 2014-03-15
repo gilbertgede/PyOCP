@@ -45,23 +45,20 @@ def num_diff(f_in, x0, var=0, num_args=1):
     if num_args > 1:
         f = lambda x: f_in(*x)
 
-    def f3(h):
-        return 0.5 / (sum(h)**3) * (-f(x0 - 2*h) + 2 * f(x0 - h) -
-                                    2 * f(x0 + h) + f(x0 + 2*h))
-
+    f3 = lambda h: 0.5 / (sum(h)**3) * (-f(x0 - 2*h) + 2 * f(x0 - h) -
+                                        2 * f(x0 + h) + f(x0 + 2*h))
     dx = numpy.zeros(len(x0))
-    h0 = 1.e-4
-    dx[var] = h0
+    dx[var] = 1.e-4
     for i in range(5):
-        temp = f3(dx)
-        if norm(temp) < eps:     # This is for functions where f'''(x) = 0
-            dx[var] = h0 = 1     # If they're polynomial and this happens, the
-            break                # step size doesn't really matter?
-        dx[var] = (3 * eps / norm(temp))**(1./3.)
-        if abs(h0 - dx[var]) < eps:
-            h0 = dx[var]
-            break
         h0 = dx[var]
+        temp = norm(f3(dx))
+        if temp < eps:     # This is for functions where f'''(x) = 0
+            dx[var] = 1    # If they're polynomial and this happens, the
+            break          # step size doesn't really matter?
+        dx[var] = (3 * eps / temp)**(1./3.)
+        if abs(h0 - dx[var]) < eps:
+            break
+    h0 = dx[var]
 
     return 0.5 / h0 * (f(x0 + dx) - f(x0 - dx))
 
@@ -101,15 +98,13 @@ def pull_out_derivatives(D_vector, name, dv_ind_var, func_dict):
     num_args = [len(ders[d].args) for d in key_list]
 
     # Needed due to the scope issues w/ lambda functions
-    def callback_factory(f, xf, i, na):
+    def cbf(f, xf, i, na):
         return lambda x: num_diff(f, xf(x), i, na)
 
-    D_func_list = []
-    for i in range(len(f)):
-        D_func_list += [callback_factory(f[i], x0_func[i], index[i], num_args[i])]
-
     D_func = DeferredVector(name)
-    D_func_dict = dict(zip(key_list, D_func))
-    return D_func, D_func_list, D_func_dict
+    # Order is: D_func, D_func_list, D_func_dict
+    return (D_func,
+            [cbf(f[i], x0_func[i], index[i], num_args[i]) for i in range(len(f))],
+            dict(zip(key_list, D_func)))
 
 
