@@ -1,5 +1,5 @@
 from pyocp.common import *
-from pyocp.arc import arc
+from pyocp.arc_c import arc
 from sympy import sin, cos, sqrt
 import numpy as np
 from scipy.sparse import coo_matrix

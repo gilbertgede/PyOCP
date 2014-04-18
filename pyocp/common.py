@@ -1,5 +1,5 @@
 from sympy import (symbols, Function, Matrix, Symbol, zeros, oo, sympify,
-                   DeferredVector as DV, lambdify, Subs, Dummy)
+                   DeferredVector as DV, lambdify, Subs, Dummy, ccode, S)
 from sympy.core.function import AppliedUndef, Derivative
 import numpy
 from numpy.linalg import norm
@@ -7,6 +7,7 @@ from scipy import sparse as sp
 from numba import autojit
 
 eps = numpy.finfo(numpy.float64).eps
+big = 1 / eps**2
 t = symbols('t')
 
 # These are just to make the translation process easier, so that the parts of
