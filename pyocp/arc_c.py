@@ -1,5 +1,4 @@
 from .common import *
-import re
 
 class arc(object):
     """
@@ -31,9 +30,7 @@ class arc(object):
     This is still a work in progress...
     """
 
-    template_names = {}
-
-    def __init__(self, number, time_symbol, name=None):
+    def __init__(self, number, time_symbol, name=None, subarc=False):
         """
         Initializer for arc class.
 
@@ -41,14 +38,33 @@ class arc(object):
         "atmospheric_phase"). If no name is given, the arc number is used.
         """
 
-        self._number = number
-        self._time = sympify(time_symbol)
+        self.number = number
         if name:
-            self._name = name
+            self.name = name
         else:
-            self._name = "Arc " + str(number)
-        self._constraints_set = False
+            self.name = "Arc " + str(number)
 
+        self.time = sympify(time_symbol)
+
+        self._obj_init = sympify(0)
+        self._obj_term = sympify(0)
+
+        self._initial = Matrix([[]])
+        self._terminal = Matrix([[]])
+        self._g = Matrix([[]])
+
+        self._t_i = (0, 0, 0)
+        self._t_f = (1, 1, 1)
+        self._initial_guesses = {}
+        self._param_limits = {}
+
+        self.subarc = subarc
+        self._left_internal = False
+        self._right_internal = False
+        self._subarc_jgr = []
+        self._subarc_jgc = []
+
+        self.template_names = {}
 
     def _sanitize_bounds(self, bounds, n, name, cons=False):
         """
@@ -70,7 +86,7 @@ class arc(object):
         func_list = [i for i in self._funcs]
 
         for v in bounds:
-            syms = v.atoms(Symbol) - {self._time,}
+            syms = v.atoms(Symbol) - {self.time,}
             pararg_list += [i for i in syms if i not in pararg_list]
 
             bad = v.atoms(AppliedUndef)
@@ -84,7 +100,7 @@ class arc(object):
                             (b.func in func_list)):
                         func_list += [b.func]
 
-        self._params_args = Matrix(pararg_list)
+        self._params_args = pararg_list
         self._funcs = Matrix(func_list)
 
 
@@ -100,6 +116,9 @@ class arc(object):
 
         """
 
+        if len(x) == 0:
+            return lead + "n/a"
+
         ls = repr(l).split('\n')
         xs = repr(x).split('\n')
         us = repr(u).split('\n')
@@ -107,10 +126,8 @@ class arc(object):
         if len(xs) == 1:
             outstr = lead
             for v in [ls, xs, us]:
-                start = 'Matrix([['
-                end = ')]]'
-                res = v[0][len(start):-len(end)]
-                outstr += res + ' ≤ '
+                # start='Matrix([['=len 9 - end=')]]'=len 3
+                outstr += v[0][9:-3] + ' ≤ '
             return outstr[:-3]
         else:
             for v in [ls, xs, us]:
@@ -163,10 +180,8 @@ class arc(object):
 
         """
 
-        self._obj_init = sympify(0)
         if 'init' in kwargs:
             self._obj_init += kwargs['init']
-        self._obj_term = sympify(0)
         if 'term' in kwargs:
             self._obj_term += kwargs['term']
 
@@ -183,7 +198,7 @@ class arc(object):
         need to be identified and supplied in the specified_list argument.
         """
 
-        t = self._time
+        t = self.time
 
         allvars_set = set()
         state_set = set()
@@ -238,14 +253,12 @@ class arc(object):
             pars = ode.atoms(Symbol)
             params_set.update(pars)
         params_set -= {t,}
-        self._params_args = Matrix(list(params_set))
+        self._params_args = list(params_set)
 
 
-    def constraints(self, **kwargs):
+    def boundary_constraints(self, **kwargs):
         """
-        Function to supply more complex constraints.
-
-        Allows initial, terminal, and path equality and inequaltiy constraints.
+        Function to supply more constraints at the beginning and end of an arc.
 
         Valid keyword arguments are:
             initial : list
@@ -254,6 +267,62 @@ class arc(object):
             terminal : list
                 A list of constraint equations for t=t_f. Can be function of
                 states, controls, parameters, and functions.
+            t_i : 1-tuple or 3-tuple
+                If a fixed initial, supply a numeric value. If not fixed,
+                supply the initial guess for the value and lower and upper
+                boundaries on the initial time.
+            t_f : 1-tuple or 3-tuple
+                Same requirements for t_i, except for the final time for the arc.
+        """
+
+        if 't_i' in kwargs:
+            v = kwargs['t_i']
+            if len(v) == 1:
+                self._t_i = (v[0], v[0], v[0])
+            else:
+                t_i = symbols(self.time.name + '_i')
+                self._t_i = (t_i, v[1], v[2])
+                self._params_args += [t_i]
+                self._params = Matrix(list(self._params) + [t_i])
+                self._param_limits[t_i] = (v[1], v[2])
+                self._initial_guesses[t_i] = v[0]
+
+        if 't_f' in kwargs:
+            v = kwargs['t_f']
+            if len(v) == 1:
+                self._t_f = (v[0], v[0], v[0])
+            else:
+                t_f = symbols(self.time.name + '_f')
+                self._t_f = (t_f, v[1], v[2])
+                self._params_args += [t_f]
+                self._params = Matrix(list(self._params) + [t_f])
+                self._param_limits[t_f] = (v[1], v[2])
+                self._initial_guesses[t_f] = v[0]
+
+        i_to_add = []
+        if 'left_internal' in kwargs and kwargs['left_internal'] is True:
+            if self._t_i[1] != self._t_i[2]:
+                i_to_add = [-t_i]
+            self._left_internal = True
+        t_to_add = []
+        if 'right_internal' in kwargs and kwargs['right_internal'] is True:
+            if self._t_f[1] != self._t_f[2]:
+                t_to_add = [t_f]
+            self._right_internal = True
+
+        if 'initial' in kwargs:
+            self._initial = Matrix(kwargs['initial'] + i_to_add)
+            self._sanitize_bounds(self._initial, len(self._initial), 'initial', True)
+        if 'terminal' in kwargs:
+            self._terminal = Matrix(kwargs['terminal'] + t_to_add)
+            self._sanitize_bounds(self._terminal, len(self._terminal), 'terminal', True)
+
+
+    def path_constraints(self, **kwargs):
+        """
+        Function to supply path equality and inequaltiy constraints.
+
+        Valid keyword arguments are:
             g : SymPy Matrix
                 A SymPy matrix containing equality constraint expressions
                 (requires g_l, g_u to be supplied). For equality constraints,
@@ -271,56 +340,26 @@ class arc(object):
                 format as g_l.
         """
 
-        times = ('initial', 'terminal')
-        for v in times:
-            if v in kwargs:
-                val = Matrix(kwargs[v])
-                self._sanitize_bounds(val, len(val), v, True)
-                self.__setattr__('_' + v, val)
-            else:
-                self.__setattr__('_' + v, Matrix([[]]))
-
         if 'g' in kwargs:
-            val = kwargs['g']
-            self._sanitize_bounds(val, len(val), 'g', True)
-            self.__setattr__('_g', val)
-        else:
-            self.__setattr__('_g', Matrix([[]]))
+            self._g = kwargs['g']
+            self._sanitize_bounds(self._g, len(self._g), 'g', True)
 
         ng = len(self._g)
-        bounds = (('g_l', -oo, ng), ('g_u', oo, ng))
-        for v in bounds:
-            if v[0] in kwargs:
-                val = kwargs[v[0]]
-                self._sanitize_bounds(val, v[2], v[0])
-                self.__setattr__('_' + v[0], val)
-            else:
-                self.__setattr__('_' + v[0], Matrix([v[1]] * v[2]))
-
-        self._constraints_set = True
+        self._g_l = Matrix([-oo] * ng)
+        self._g_u = Matrix([ oo] * ng)
+        if 'g_l' in kwargs:
+            self._g_l = Matrix(kwargs['g_l'])
+            self._sanitize_bounds(self._g_l, ng, 'g_l')
+        if 'g_u' in kwargs:
+            self._g_u = Matrix(kwargs['g_u'])
+            self._sanitize_bounds(self._g_u, ng, 'g_u')
 
 
-    def bounds(self, arguments, **kwargs):
+    def continuous_bounds(self, **kwargs):
         """
-        Function to define time, state, control, and parameter boundaries.
-
-        Arguments are:
-            arguments : list
-                A list of symbolic quantities which are fixed needs to be
-                supplied, to allow for proper identificiation of "free"
-                parameters.
+        Function to define state and control boundaries.
 
         Valid keyword arguments are:
-            t_i : 2-tuple
-                Represents upper and lower bounds on initial time. If the 2
-                values are not equal, value is free. Tuple entries need to be
-                sympifiable, and not contain states, controls, specified, or
-                parameters. If not provided, assumed to be fixed at 0.
-            t_f : 2-tuple
-                Represents upper and lower bounds on final time. If the 2
-                values are not equal, value is free. Tuple entries need to be
-                sympifiable, and not contain states, controls, specified, or
-                parameters. If not provided, assumed to be fixed at 1.
             x_limits : dict
                 Represents the lower/upper bounds on state variables. If not
                 provided bounds are assumed to be (-oo, oo). Format is a
@@ -334,43 +373,23 @@ class arc(object):
                 Represents lower/upper bounds on control variables; same input
                 requirements as x_limits. User is responsible for identifying
                 all desired controls are included.
-            param_limits : dict
-                Represents the lower/upper bounds on parameters; same input
-                requirements as x_limits.  The user is responsible for
-                identifying parameters.
         """
-
-        if self._constraints_set is not True:
-            raise("Constraints need to be defined before bounds are defined.")
-
-        times = (('t_i', 0), ('t_f', 1))
-        for v in times:
-            if v[0] in kwargs:
-                val = kwargs[v[0]]
-                flag = 'free'
-                if val[0] == val[1]:
-                    flag = 'fixed'
-                self._sanitize_bounds(Matrix(val), 2, v[0])
-                self.__setattr__('_' + v[0], (flag, val[0], val[1]))
-            else:
-                self.__setattr__('_' + v[0], ('fixed', v[1], v[1]))
 
         nx = len(self._states)
         nu = len(self._controls)
 
         x_lower = []
         x_upper = []
-        try:
-            xlims = kwargs.pop('x_limits')
-        except:
-            xlims = {}
+        xlims = {}
+        if 'x_limits' in kwargs:
+            xlims = kwargs['x_limits']
         for s in self._states:
             if s in xlims:
                 x_lower += [xlims[s][0]]
                 x_upper += [xlims[s][1]]
             else:
                 x_lower += [-oo]
-                x_upper += [oo]
+                x_upper += [ oo]
         self._x_l = Matrix(x_lower)
         self._x_u = Matrix(x_upper)
         self._sanitize_bounds(self._x_l, nx, 'x_l')
@@ -378,43 +397,48 @@ class arc(object):
 
         u_lower = []
         u_upper = []
-        try:
-            ulims = kwargs.pop('u_limits')
-        except:
-            ulims = {}
+        ulims = {}
+        if 'u_limits' in kwargs:
+            ulims = kwargs['u_limits']
         for c in self._controls:
             if c in ulims:
                 u_lower += [ulims[c][0]]
                 u_upper += [ulims[c][1]]
             else:
                 u_lower += [-oo]
-                u_upper += [oo]
+                u_upper += [ oo]
         self._u_l = Matrix(u_lower)
         self._u_u = Matrix(u_upper)
         self._sanitize_bounds(self._u_l, nu, 'u_l')
         self._sanitize_bounds(self._u_u, nu, 'u_u')
 
 
-        temp_set = set(list(self._params_args))
+    def parameter_bounds(self, arguments=[], param_limits={}):
+        """
+        Function to define bounds on parameters and which symbols are fixed
+        constants.
+
+        Arguments are:
+            arguments : list
+                A list of symbolic quantities which are fixed needs to be
+                supplied, to allow for proper identificiation of "free"
+                parameters.
+            param_limits : dict
+                Represents the lower/upper bounds on parameters; same input If
+                not provided bounds are assumed to be (-oo, oo). Format is a
+                dict: {param_1 : (lower, upper), param_2 : (lower, upper),
+                ...}. Valid entries in the Matrix are: SymPy Symbols, constant
+                numerical scalars, or valid SymPy expressions with no
+                dependencies on "free quantities" (states, controls,
+                parameters, etc.). The user is responsible for identifying
+                parameters.
+        """
+
+        self._param_limits.update(param_limits)
+        temp_set = set(self._params_args)
         temp_set -= set(arguments)
         self._params = Matrix(list(temp_set))
         self._arguments = Matrix(arguments)
-
-        p_lower = []
-        p_upper = []
-        try:
-            plims = kwargs.pop('param_limits')
-        except:
-            plims = {}
-        for p in self._params:
-            if p in plims:
-                p_lower += [plims[p][0]]
-                p_upper += [plims[p][1]]
-            else:
-                p_lower += [-oo]
-                p_upper += [oo]
-        self._p_l = Matrix(p_lower)
-        self._p_u = Matrix(p_upper)
 
 
     """
@@ -438,68 +462,66 @@ class arc(object):
 
     """
 
-    def problem_definition(self, **kwargs):
+    def __str__(self):
         """
         Prints out the current problem, as well as how all the symbolic
         quantities have been partitioned.
-
-        If no keyword arguments are provided, simply prints out the problem.
-        If keyword args are provided, checks the changes between symbolic
-        classification, and regroups the variables as instructed. Use the
-        following kwargs:
-
-            to be developed...
-
         """
 
-        if len(kwargs) == 0:
-            lead = '      '
-            t = self._time
-            ti = symbols(t.name + '_i')
-            tf = symbols(t.name + '_f')
-            print('Definition for ' + self._name + '\n')
-            print('Objective Function')
-            print('  min:')
-            obj_i = self._obj_init.subs(t, ti)
-            obj_f = self._obj_term.subs(t, tf)
-            print(lead + str(obj_i + obj_f))
-            print('')
+        out_str = ""
+        lead = '      '
+        t = self.time
+        ti = symbols(t.name + '_i')
+        tf = symbols(t.name + '_f')
+        out_str += '\nDefinition for %s\n\n' % self.name
+        out_str += 'Objective Function\n'
+        out_str += '  min:\n'
+        obj_i = self._obj_init.subs(t, ti)
+        obj_f = self._obj_term.subs(t, tf)
+        out_str += lead + str(obj_i + obj_f) + '\n\n'
 
-            print('Quantities')
-            text = ['states', 'controls', 'functions', 'parameters', 'arguments']
-            vals = [self._states, self._controls, self._funcs, self._params, self._arguments]
-            for i in range(len(text)):
-                print('  %s:' % text[i])
-                print(lead + str([v for v in vals[i]]))
-            print('')
+        out_str += 'Quantities\n'
+        text = ['states', 'controls', 'functions', 'parameters', 'arguments']
+        vals = [self._states, self._controls, self._funcs, self._params, self._arguments]
+        for i in range(len(text)):
+            out_str += '  %s:\n' % text[i]
+            out_str += lead + str([v for v in vals[i]]) + '\n'
+        out_str += '\n'
 
-            print('Constraints')
-            print('  times:')
-            tees = [(self._t_i, 't_i'), (self._t_f, 't_f')]
-            for t in tees:
-                if t[0][0] == 'fixed':
-                    print(lead + '%s = ' % t[1] + str(t[0][1]))
-                else:
-                    print(lead + str(t[0][1]) + ' ≤ %s ≤ ' % t[1] + str(t_i[2]))
-            print('  state bounds:')
-            print(self._print_bounds(self._x_l, self._states, self._x_u, lead))
-            print('  control bounds:')
-            print(self._print_bounds(self._u_l, self._controls, self._u_u, lead))
-            print('  parameter bounds:')
-            print(self._print_bounds(self._p_l, self._params, self._p_u, lead))
-            init_term = [(self._initial, 'initial conditions'), (self._terminal, 'terminal conditions')]
-            for it in init_term:
-                if it != Matrix([[]]):
-                    print('  %s:' % it[1])
-                    strs = [str(i) for i in it[0]]
-                    for s in strs:
-                        print(lead + '0 = %s' % s)
-            if self._g != Matrix([[]]):
-                print('  path constraints:')
-                print(self._print_bounds(self._g_l, self._g, self._g_u, lead))
-            print('')
-        else:
-            pass
+        out_str += 'Constraints\n'
+        out_str += '  times:\n'
+        tees = [(self._t_i, 't_i'), (self._t_f, 't_f')]
+        for t in tees:
+            #t[0][1] == t[0][2]
+            if t[0][0] == 'fixed':
+                out_str += lead + '%s = ' % t[1] + str(t[0][0]) + '\n'
+            else:
+                out_str += lead + str(t[0][1]) + ' ≤ %s ≤ ' % t[1] + str(t[0][2]) + '\n'
+        out_str += '  state bounds:\n'
+        out_str += self._print_bounds(self._x_l, self._states, self._x_u, lead) + '\n'
+        out_str += '  control bounds:\n'
+        out_str += self._print_bounds(self._u_l, self._controls, self._u_u, lead) + '\n'
+        # TODO fix this part
+        #if len(self._params) > 0:
+        #    out_str += '  parameter bounds:\n'
+        #    out_str += self._print_bounds(self._p_l, self._params, self._p_u, lead) + '\n'
+
+        if self._initial != Matrix([[]]) and self._left_internal is False:
+            out_str += '  initial conditions:\n'
+            for i in self._initial:
+                out_str += lead + '0 = %s\n' % str(i)
+
+        if self._terminal != Matrix([[]]) and self._right_internal is False:
+            out_str += '  terminal conditions:\n'
+            for i in self._terminal:
+                out_str += lead + '0 = %s\n' % str(i)
+
+        if self._g != Matrix([[]]):
+            out_str += '  path constraints:\n'
+            out_str += self._print_bounds(self._g_l, self._g, self._g_u, lead) + '\n'
+        return out_str
+
+    __repr__ = __str__
 
 
     def numerical_defs(self, m, states_guess, controls_guess, parameters_guess,
@@ -554,24 +576,18 @@ class arc(object):
         self._argument_values = {}
         for a in self._arguments:
             if a not in arguments:
-                raise Exception("A defined arguement did not have a value assigned")
+                raise Exception("A defined argument did not have a value assigned")
             self._argument_values[a] = arguments[a]
 
-        if self._t_i[0] == 'fixed':
-            ti = self._t_i[1]
-        else:
-            ti = symbols(self._time.name + '_i')
-        if self._t_f[0] == 'fixed':
-            tf = self._t_f[1]
-        else:
-            tf = symbols(self._time.name + '_f')
+        ti = self._t_i[0]
+        tf = self._t_f[0]
 
-        t_points = self._time_grid
+        t_points = self._time_grid.copy()
         scale = tf - ti
         for i in range(m):
             t_points[i] = ti + scale * t_points[i]
 
-        self._t_points = t_points
+        self._t_points = list(Matrix(t_points))
 
         if external_include:
             self.template_names['user_h_include'] = external_include
@@ -579,42 +595,105 @@ class arc(object):
             self.template_names['user_h_include'] = ""
 
         funcs = self._funcs
-        temp_wrap = ""
+        temp_wrap = dict()
         for f in funcs:
             temp_args = []
             for i in range(len(f.args)):
-                temp_args += ['*x[%d]' % i]
-            temp_wrap += (
-             "double UW_%s(double *x)\n" % str(type(f))+
-             "{\n" +
+                temp_args += ['x[%d]' % i]
+            base = "double UW_%s(double *x)" % str(type(f))
+            temp_wrap[base] = (base + "\n{\n" +
              "  return %s(%s);\n" % (str(type(f)), ', '.join(temp_args)) +
              "}\n")
-        self.template_names['wrap_user_funcs'] = temp_wrap
+        if self.subarc is False:
+            temp_str = "\n".join(temp_wrap.values())
+            self.template_names['wrap_user_funcs'] = temp_str
+        else:
+            self.template_names['wrap_user_funcs'] = '\n'
+            self._wrapped_funcs = temp_wrap
 
-        guesses = ""
-        temp_dict = states_guess.copy()
-        temp_dict.update(controls_guess)
+        n = len(self._states)
+        guesses = []
+        in_dict = self._initial_guesses
+        in_dict.update(states_guess)
+        in_dict.update(controls_guess)
+        in_dict.update(parameters_guess)
+        temp_dict = {}
         temp_list = list(self._states) + list(self._controls)
+
+        for i in temp_list:
+            if len(in_dict[i]) != len(self._time_grid):
+                tg = [min(self._time_grid), max(self._time_grid)]
+                temp_dict[i] = numpy.interp(self._time_grid, tg, in_dict[i])
+            else:
+                temp_dict[i] = in_dict[i]
+
         idx = 0
         for i in range(m):
             for j in temp_list:
-                guesses += "  x[%d] = %s;\n" % (idx, ccode(S(temp_dict[j][i])))
+                guesses += ["  x[%d] " + "= %s;\n" % ccode(S(temp_dict[j][i]))]
                 idx += 1
         for p in self._params:
-            guesses += "  x[%d] = %s;\n" % (idx, ccode(S(parameters_guess[p])))
+            guesses += ["  x[%d] " + "= %s;\n" % ccode(S(in_dict[p]))]
             idx += 1
-        self.template_names['initial_nlp_values'] = guesses
+        self._guesses = guesses
 
 
-    def generate_c_files(self):
+        g_lower = [0] * len(self._initial)
+        g_upper = [0] * len(self._initial)
+        for i in range(m - 1):
+            g_lower += list(self._g_l)
+            g_upper += list(self._g_u)
+            g_lower += [0] * n
+            g_upper += [0] * n
+        g_lower += list(self._g_l)
+        g_upper += list(self._g_u)
+        g_lower += [0] * len(self._terminal)
+        g_upper += [0] * len(self._terminal)
+        cbd = []
+        for i in range(len(g_lower)):
+            temp = "  g_L[%d" + " + %d] = %s;\n" % (i, ccode(S(g_lower[i])))
+            temp += "  g_U[%d" + " + %d] = %s;\n" % (i, ccode(S(g_upper[i])))
+            cbd += [temp]
+        self._constraints_bounds_definition = cbd
+
+        p_lower = []
+        p_upper = []
+        for p in self._params:
+            if p in self._param_limits:
+                p_lower += [self._param_limits[p][0]]
+                p_upper += [self._param_limits[p][1]]
+            else:
+                p_lower += [-oo]
+                p_upper += [oo]
+        self._p_l = Matrix(p_lower)
+        self._p_u = Matrix(p_upper)
+
+
+        lower = []
+        upper = []
+        for i in range(m):
+            lower += [j for j in self._x_l]
+            lower += [j for j in self._u_l]
+            upper += [j for j in self._x_u]
+            upper += [j for j in self._u_u]
+        lower += [l for l in self._p_l]
+        upper += [u for u in self._p_u]
+        nlp_b_def = []
+        for i in range(len(lower)):
+            temp = "  x_L[%d" + " + %d] = %s;\n" % (i, ccode(S(lower[i])))
+            temp += "  x_U[%d" + " + %d] = %s;\n" % (i, ccode(S(upper[i])))
+            nlp_b_def += [temp]
+        self._nlp_bounds_def = nlp_b_def
+
+
+    def generate_c_files(self, **kwargs):
         """
         Generates functions for the NLP solver.
 
-        Right now, only works for IPOPT, producing sparse matrices, and does so
-        in a slow fashion (Python, not C).
+        Right now, only works for IPOPT.
         """
 
-        t = self._time
+        t = self.time
         states = self._states
         controls = self._controls
         params = self._params
@@ -630,85 +709,72 @@ class arc(object):
         m = self._m
         ng = len(g)
 
+        # Filling the initial values
+
+        self.template_names['initial_nlp_values'] = ""
+        for i in range(len(self._guesses)):
+            self.template_names['initial_nlp_values'] += self._guesses[i] % i
+
         # the values for arguments (user controllable constants)
-        arg_struct_def = "struct MyUserData\n{\n"
-        for i in self._arguments:
-            arg_struct_def += "  Number %s;\n" % str(i)
-        arg_struct_def += "  };\n"
+        arg_defs = ["  Number %s;\n" % str(a) for a in self._arguments]
+        arg_struct_def = "struct MyUserData\n{\n%s};\n" % "".join(arg_defs)
 
         arg_struct_fill = ""
-        for i in self._arguments:
-            arg_struct_fill += "  Number %s = %s;\n" % (str(i), ccode(S(self._argument_values[i])))
-            arg_struct_fill += "  user_data.%s = %s;\n" % (str(i), str(i))
+        for a in self._arguments:
+            arg_struct_fill += "  Number %s = %s;\n" % (str(a), ccode(S(self._argument_values[a])))
+            arg_struct_fill += "  user_data.%s = %s;\n" % (str(a), str(a))
 
-        arg_struct_unpack = ""
-        for i in self._arguments:
-            arg_struct_unpack += "  Number %s = my_data->%s;\n" % (str(i), str(i))
+        arg_struct_unpack = "".join(["  Number %s = my_data->%s;\n" % (str(a), str(a)) for a in self._arguments])
+
 
         self.template_names['arg_struct_def'] = arg_struct_def
         self.template_names['arg_struct_fill'] = arg_struct_fill
-        self.template_names['arg_struct_unpack'] = arg_struct_unpack
 
+        if 'arg_struct_unpack' in kwargs:
+            self.template_names['arg_struct_unpack'] = kwargs['arg_struct_unpack']
+        else:
+            self.template_names['arg_struct_unpack'] = arg_struct_unpack
 
         # The mapping from sympy to numeric
-        lower = []
-        upper = []
         X = DeferredVector('X')
         x = []
         for i in range(m):
             x += [j.subs(t, t_points[i]) for j in states]
             x += [j.subs(t, t_points[i]) for j in controls]
-            lower += [j for j in self._x_l]
-            lower += [j for j in self._u_l]
-            upper += [j for j in self._x_u]
-            upper += [j for j in self._u_u]
         x += [i for i in params]
-        lower += [l for l in self._p_l]
-        upper += [u for u in self._u_u]
         to_num = dict(zip(x, X))
-
-        nlp_bounds_definition = ""
-        for i in range(len(lower)):
-            nlp_bounds_definition += "  x_L[%d] = %s;\n" % (i, ccode(S(lower[i])))
-            nlp_bounds_definition += "  x_U[%d] = %s;\n" % (i, ccode(S(upper[i])))
-
         self.template_names['num_nlp_vars'] = len(x)
-        self.template_names['nlp_bounds_definition'] = nlp_bounds_definition
+
+        nbd = ""
+        for bd in self._nlp_bounds_def:
+            nbd += bd % (0, 0)
+        self.template_names['nlp_bounds_definition'] = nbd
 
 
         self.template_names['num_nlp_constraints'] = (len(self._initial) +
                                                       len(self._terminal) +
                                                       m * len(self._g) +
                                                       (m - 1) * n)
-        g_lower = [0] * len(self._initial)
-        g_upper = [0] * len(self._initial)
-        for i in range(m - 1):
-            g_lower += list(self._g_l)
-            g_upper += list(self._g_u)
-            g_lower += [0] * n
-            g_upper += [0] * n
-        g_lower += list(self._g_l)
-        g_upper += list(self._g_u)
-        g_lower += [0] * len(self._terminal)
-        g_upper += [0] * len(self._terminal)
-        cbd = ""
-        for i in range(len(g_lower)):
-            cbd += "  g_L[%d] = %s;\n" % (i, ccode(S(g_lower[i])))
-            cbd += "  g_U[%d] = %s;\n" % (i, ccode(S(g_upper[i])))
-        self.template_names['constraints_bound_definition'] = cbd
+
+        self.template_names['constraints_bounds_definition'] = ""
+        for cbd in self._constraints_bounds_definition:
+            self.template_names['constraints_bounds_definition'] += cbd % (0, 0)
 
 
         t_points_num = list(Matrix(t_points).subs(to_num))
         # This gives the numerical values for t at each time point
-        t_ccode = ("    Number *t;\n" +
-                   "    t = (Number*)malloc(sizeof(Number)*n);\n")
+        t_ccode =  ("    Number t[%d];\n" % len(t_points_num))
+        t_ccode += ("    Number grid[%d];\n" % len(self._time_grid))
         idx = 0
         for i in t_points_num:
-            t_ccode += "    t[%d] = " % idx + ccode(i) + ";\n"
+            t_ccode += "    t[%d] = %s;\n" % (idx, ccode(i))
+            idx += 1
+        idx = 0
+        for i in self._time_grid:
+            t_ccode += "    grid[%d] = %s;\n" % (idx, ccode(S(i)))
             idx += 1
 
         self.template_names['t_ccode'] = t_ccode
-
 
 
 
@@ -745,15 +811,13 @@ class arc(object):
         grad_f_definition = ""
         if len(temp_ders) > 0:
             grad_f_definition += ("  Number diffs[%d];\n" % len(temp_ders) +
-                                  "  Number *xtemp;\n" +
-                                  "  xtemp = (Number*)malloc(sizeof(Number) * %d);\n"
-                                  % max_args)
+                                  "  Number xtemp[%d];\n" % max_args)
 
             idx = 0
-            for os in out_string:
-                for o in os[:-1]:
+            for ostr in out_string:
+                for o in ostr[:-1]:
                     grad_f_definition += o
-                grad_f_definition += "  diffs[%d] = %s;\n" % (idx, os[-1])
+                grad_f_definition += "  diffs[%d] = %s;\n" % (idx, ostr[-1])
                 idx += 1
 
         for i in range(len(x)):
@@ -765,7 +829,6 @@ class arc(object):
             grad_f_definition += "  grad_f[%d] = %s;\n" % (present[i], ccode(g_f_s))
 
         self.template_names['grad_f_definition'] = grad_f_definition
-
 
 
 
@@ -791,15 +854,21 @@ class arc(object):
         terminal = self._terminal.subs(t, t_points[-1])
         init_ccode = [ccode(i.subs(to_num)) for i in initial]
         term_ccode = [ccode(i.subs(to_num)) for i in terminal]
+        temp = ""
+        if self._left_internal is True:
+            temp = "+"
         for i in range(len(initial)):
-            g_def += "  g[%d] = %s;\n" % (i, init_ccode[i])
+            g_def += "  g[%d] %s= %s;\n" % (i, temp, init_ccode[i])
+        if self._right_internal is True:
+            temp = "+"
         for i in range(len(terminal)):
-            g_def += "  g[%d] = %s;\n" % (num_nlp_g + i - len(terminal), term_ccode[i])
+            g_def += "  g[%d] %s= %s;\n" % (num_nlp_g + i - len(terminal), temp, term_ccode[i])
 
         # Used for the path constraints
         L = DeferredVector('local')
         local_num_list = list(states) + list(controls) + list(params) + [t]
         local_num = dict(zip(local_num_list, L))
+
         g_ccode = [ccode(i.subs(local_num)) for i in g]
         g_def += "  Number local[%d];\n" % len(local_num_list)
 
@@ -819,8 +888,12 @@ class arc(object):
 
 
         # Used for the defects
-        t_l = symbols(t.name + '_l')
-        t_r = symbols(t.name + '_r')
+        t_i = self._t_i[0]
+        t_f = self._t_f[0]
+        grid_l = symbols('grid_l')
+        grid_r = symbols('grid_r')
+        t_l = grid_l * (t_f - t_i) + t_i
+        t_r = grid_r * (t_f - t_i) + t_i
         dt = t_r - t_l
         y_0 = self._rename_funcs(states, '_0').subs(t, t_l)
         y_1 = self._rename_funcs(states, '_1').subs(t, t_r)
@@ -834,8 +907,9 @@ class arc(object):
         defect = y_1 - y_0 - dt / 6 * (f_1 + f_0 + 4 *
                                        odes.subs(list(zip(states, y_c)) +
                                                  list(zip(controls, u_c))).subs(t, t_c))
+
         D = DeferredVector('d_local')
-        defect_num_list = list(y_0) + list(u_0) + list(y_1) + list(u_1) + list(params) + [t_l, t_r]
+        defect_num_list = list(y_0) + list(u_0) + list(y_1) + list(u_1) + list(params) + [grid_l, grid_r]
         defect_num = dict(zip(defect_num_list, D))
         d_ccode = [ccode(i.subs(defect_num)) for i in defect]
 
@@ -852,9 +926,9 @@ class arc(object):
         for i in range(len(params)):
             g_def += "    d_local[%d] = X[%d];\n" % (idx, len(x) - len(params) + i)
             idx += 1
-        g_def += "    d_local[%d] = t[iii];\n" % idx
+        g_def += "    d_local[%d] = grid[iii];\n" % idx
         idx += 1
-        g_def += "    d_local[%d] = t[iii + 1];\n" % idx
+        g_def += "    d_local[%d] = grid[iii + 1];\n" % idx
         for i in range(len(d_ccode)):
             g_def += "    g[iii * %d + %d + %d] = %s;\n" % (n + ng, i, ng + len(init_ccode), d_ccode[i])
         g_def += "  }\n"
@@ -894,15 +968,17 @@ class arc(object):
             temp = sorted([j._num for j in initial[i].atoms(DeferredSymbol)])
             for j in range(len(temp)):
                 jac_g_rows_cols += "    iRow[%d] = %d;\n" % (jac_g_rc_idx, i)
+                self._subarc_jgr += ["    iRow[%d" % jac_g_rc_idx + " + %d] = " + "%d" % i + " + %d;\n"]
                 jac_g_rows_cols += "    jCol[%d] = %d;\n" % (jac_g_rc_idx, temp[j])
+                self._subarc_jgc += ["    jCol[%d" % jac_g_rc_idx + " + %d] = " + "%d" % temp[j] + " + %d;\n"]
                 jac_g_rc_idx += 1
                 present_i_diffed += [initial[i].diff(X[temp[j]])]
         init_ders, out_strs, max_args_i = pull_out_derivatives(present_i_diffed, "    ")
         der_list += init_ders
-        for os in out_strs:
-            for o in os[:-1]:
-                grad_f_definition += o
-            grad_f_definition += "    diffs[%d] = %s;\n" % (diff_idx, os[-1])
+        for ostr in out_strs:
+            for o in ostr[:-1]:
+                jac_g_diffs += o
+            jac_g_diffs += "    diffs[%d] = %s;\n" % (diff_idx, ostr[-1])
             diff_idx += 1
         diff_dict = dict(zip(der_list, DeferredVector('diffs')))
         for j in range(len(present_i_diffed)):
@@ -914,16 +990,20 @@ class arc(object):
         for i in range(terminal.rows):
             temp = sorted([j._num for j in terminal[i].atoms(DeferredSymbol)])
             for j in range(len(temp)):
-                jac_g_rows_cols += "    iRow[%d] = %d;\n" % (jac_g_rc_idx, len(initial) + (m - 1) * n + m * len(g) + i)
-                jac_g_rows_cols += "    jCol[%d] = %d;\n" % (jac_g_rc_idx, temp[j])
+                r = len(initial) + (m - 1) * n + m * len(g) + i
+                jac_g_rows_cols += "    iRow[%d] = %d;\n" % (jac_g_rc_idx, r)
+                self._subarc_jgr += ["    iRow[%d" % jac_g_rc_idx + " + %d] = " + "%d" % r + " + %d;\n"]
+                c = temp[j]
+                jac_g_rows_cols += "    jCol[%d] = %d;\n" % (jac_g_rc_idx, c)
+                self._subarc_jgc += ["    jCol[%d" % jac_g_rc_idx + " + %d] = " + "%d" % c + " + %d;\n"]
                 jac_g_rc_idx += 1
                 present_t_diffed += [terminal[i].diff(X[temp[j]])]
         term_ders, out_strs, max_args_t = pull_out_derivatives(present_t_diffed)
         der_list += term_ders
-        for os in out_strs:
-            for o in os[:-1]:
-                grad_f_definition += o
-            grad_f_definition += "    diffs[%d] = %s;\n" % (diff_idx, os[-1], "    ")
+        for ostr in out_strs:
+            for o in ostr[:-1]:
+                jac_g_diffs += o
+            jac_g_diffs += "    diffs[%d] = %s;\n" % (diff_idx, ostr[-1], "    ")
             diff_idx += 1
         diff_dict = dict(zip(der_list, DeferredVector('diffs')))
         for j in range(len(present_t_diffed)):
@@ -939,7 +1019,6 @@ class arc(object):
         der_list += g_ders
 
         dg_ccode = []
-        # TODO This isn't right - as der_list isn't the full length of diffs
         diff_dict = dict(zip(g_ders, DeferredVector('l_diffs')))
         for i in range(D_g.rows):
             temp = []
@@ -948,15 +1027,18 @@ class arc(object):
                 temp += [ccode(temp_subs)]
             dg_ccode += [temp]
 
+
         for j in range(m):
             for k in range(D_g.rows):
                 for ii in range(D_g.cols):
                     r = len(initial) + j * (D_g.rows + n) + k
                     jac_g_rows_cols += "    iRow[%d] = %d;\n" % (jac_g_rc_idx, r)
+                    self._subarc_jgr += ["    iRow[%d" % jac_g_rc_idx + " + %d] = " + "%d" % r + " + %d;\n"]
                     c = j * (n + 1) + ii
                     if ii >= n + nu:
-                        c = (n + nu) * m + ii
+                        c = (n + nu) * (m-1) + ii
                     jac_g_rows_cols += "    jCol[%d] = %d;\n" % (jac_g_rc_idx, c)
+                    self._subarc_jgc += ["    jCol[%d" % jac_g_rc_idx + " + %d] = " + "%d" % c + " + %d;\n"]
                     jac_g_rc_idx += 1
 
         # only do this step if it's useful
@@ -972,12 +1054,13 @@ class arc(object):
                 idx += 1
             jac_g_diffs += "      local[%d] = t[iii];\n" % idx
 
-            for os in out_strs:
-                for o in os[:-1]:
-                    grad_f_definition += o
-                grad_f_definition += "      diffs[%d] = %s;\n" % (diff_idx, os[-1])
+            for ostr in out_strs:
+                for o in ostr[:-1]:
+                    jac_g_diffs += o
+                jac_g_diffs += "      diffs[%d + iii * %d] = %s;\n" % (diff_idx, len(out_strs), ostr[-1])
                 diff_idx += 1
             jac_g_diffs += "    }\n"
+            diff_idx += (m - 1) * len(out_strs)
 
 
 
@@ -985,6 +1068,7 @@ class arc(object):
         defect_list = list(y_0) + list(u_0) + list(y_1) + list(u_1) + list(params)
         defect_def_syms = [defect_num[i] for i in defect_list]
         D_defect = defect.subs(defect_num).jacobian(defect_def_syms)
+
 
         d_ders, out_strs, max_args_d = pull_out_derivatives(D_defect, "      ")
         der_list += d_ders
@@ -998,18 +1082,18 @@ class arc(object):
                 temp += [ccode(temp_subs)]
             dd_ccode += [temp]
 
-        for j in range(m):
+        for j in range(m - 1):
             for k in range(D_defect.rows):
                 for ii in range(D_defect.cols):
                     r = len(initial) + D_g.rows + j * (D_g.rows + n) + k
                     jac_g_rows_cols += "    iRow[%d] = %d;\n" % (jac_g_rc_idx, r)
+                    self._subarc_jgr += ["    iRow[%d" % jac_g_rc_idx + " + %d] = " + "%d" % r + " + %d;\n"]
                     c = j * (n + 1) + ii
                     if ii >= 2 * (n + nu):
-                        c = (n + nu) * m + ii
+                        c = (n + nu) * (m-2) + ii
                     jac_g_rows_cols += "    jCol[%d] = %d;\n" % (jac_g_rc_idx, c)
+                    self._subarc_jgc += ["    jCol[%d" % jac_g_rc_idx + " + %d] = " + "%d" % c + " + %d;\n"]
                     jac_g_rc_idx += 1
-
-
 
 
 
@@ -1023,16 +1107,17 @@ class arc(object):
             for i in range(len(params)):
                 jac_g_diffs += "      d_local[%d] = X[%d];\n" % (idx, len(x) - len(params) + i)
                 idx += 1
-            jac_g_diffs += "      d_local[%d] = t[iii];\n" % idx
+            jac_g_diffs += "      d_local[%d] = grid[iii];\n" % idx
             idx += 1
-            jac_g_diffs += "      d_local[%d] = t[iii + 1];\n" % idx
+            jac_g_diffs += "      d_local[%d] = grid[iii + 1];\n" % idx
 
-            for os in out_strs:
-                for o in os[:-1]:
-                    grad_f_definition += o
-                grad_f_definition += "      diffs[%d] = %s;\n" % (diff_idx, os[-1])
+            for ostr in out_strs:
+                for o in ostr[:-1]:
+                    jac_g_diffs += o
+                jac_g_diffs += "      diffs[%d + iii * %d] = %s;\n" % (diff_idx, len(out_strs), ostr[-1])
                 diff_idx += 1
             jac_g_diffs += "    }\n"
+            diff_idx += (m - 2) * len(out_strs)
 
 
         num_nonzero_jac = jac_g_rc_idx
@@ -1041,11 +1126,11 @@ class arc(object):
 
         temp_str =  ("    Number l_diffs[%d];\n" % len(g_ders) +
                      "    Number d_diffs[%d];\n" % len(d_ders) +
-                     "    Number *xtemp;\n" +
-                     "    xtemp = (Number*)malloc(sizeof(Number) * %d);\n" %
+                     "    Number xtemp[%d];\n" %
                      max(max_args_i, max_args_t, max_args_g, max_args_d) +
                      "    Number local[%d];\n" % len(local_num_list) +
-                     "    Number d_local[%d];\n" % len(defect_num_list))
+                     "    Number d_local[%d];\n" % len(defect_num_list) +
+                     "    Number diffs[%d];\n" % diff_idx)
 
         jac_g_diffs = temp_str + "\n" + jac_g_diffs
 
@@ -1067,7 +1152,7 @@ class arc(object):
             idx += 1
         jac_g_values_only += "      local[%d] = t[iii];\n" % idx
         for i in range(len(g_ders)):
-            jac_g_values_only += "      l_diffs[%d] = diffs[%d + iii * %d];\n" % (i, len(init_ders) + len(term_ders), len(g_ders))
+            jac_g_values_only += "      l_diffs[%d] = diffs[%d + iii * %d];\n" % (i, len(init_ders) + len(term_ders) + i, len(g_ders))
 
         for i in range(len(dg_ccode)):
             for j in dg_ccode[i]:
@@ -1085,12 +1170,12 @@ class arc(object):
         for i in range(len(params)):
             jac_g_values_only += "      d_local[%d] = X[%d];\n" % (idx, len(x) - len(params) + i)
             idx += 1
-        jac_g_values_only += "      d_local[%d] = t[iii];\n" % idx
+        jac_g_values_only += "      d_local[%d] = grid[iii];\n" % idx
         idx += 1
-        jac_g_values_only += "      d_local[%d] = t[iii + 1];\n" % idx
+        jac_g_values_only += "      d_local[%d] = grid[iii + 1];\n" % idx
 
         for i in range(len(d_ders)):
-            jac_g_values_only += "      d_diffs[%d] = diffs[%d + iii * %d];\n" % (i, len(init_ders) + len(term_ders) + m * len(d_ders), len(d_ders))
+            jac_g_values_only += "      d_diffs[%d] = diffs[%d + iii * %d];\n" % (i, len(init_ders) + len(term_ders) + m * len(g_ders) + i, len(d_ders))
 
         for i in range(len(dd_ccode)):
             for j in dd_ccode[i]:
@@ -1101,25 +1186,83 @@ class arc(object):
         jac_g_values_only = jac_g_diffs + "\n\n" + jac_g_values_only
         self.template_names['jac_g_values_only'] = jac_g_values_only
 
-        self.template_names['base_filename'] = self._name.replace(" ", "_")
+        self.template_names['base_filename'] = self.name.replace(" ", "_")
 
         self.template_names['num_nonzero_hess'] = 0
 
+        if self.subarc is True:
+            self.template_names['hide_open'] = '/*'
+            self.template_names['hide_close'] = '*/'
+        else:
+            self.template_names['hide_open'] = ''
+            self.template_names['hide_close'] = ''
 
-        from .ipopt_template import IPOPT_c_template, IPOPT_h_template, IPOPT_makefile_template
 
-        c_code = IPOPT_c_template.format(**self.template_names)
-        h_code = IPOPT_h_template.format(**self.template_names)
+        from pyocp.ipopt_templates.makefile import IPOPT_makefile_template
+        from pyocp.ipopt_templates.arc import IPOPT_arc_c_template, IPOPT_arc_h_template
+        from pyocp.ipopt_templates.common import PyOCP_common_c, PyOCP_common_h
+
+
+        c_code = IPOPT_arc_c_template.format(**self.template_names)
+        h_code = IPOPT_arc_h_template.format(**self.template_names)
         m_code = IPOPT_makefile_template.format(**self.template_names)
         with open(self.template_names['base_filename'] + '.c', 'w') as f:
             f.write(c_code)
         with open(self.template_names['base_filename'] + '.h', 'w') as f:
             f.write(h_code)
-        with open('Makefile', 'w') as f:
-            f.write(m_code)
+        if self.subarc is False:
+            with open('Makefile', 'w') as f:
+                f.write(m_code)
+            with open('PyOCP_common.h', 'w') as f:
+                f.write(PyOCP_common_h)
+            with open('PyOCP_common.c', 'w') as f:
+                f.write(PyOCP_common_c)
 
 
+    def run_and_read(self):
+        os.system('make clean')
+        os.system('make')
+        os.system('./' + self.template_names['base_filename'])
+        self.read_results()
 
+    def read_results(self, filename=None, results=None):
+        """
+        File to read results and put them into a dictionary of lists.
+
+        Takes in a filename (if non-auto-generated) and optionally, a list of
+        results in the order output by the NLP solver.
+        """
+
+        if not results:
+            temp = []
+            if not filename:
+                filename = self.template_names['base_filename'] + '_results.csv'
+            with open(filename, 'r') as f:
+                temp += f.readlines()
+
+            nlp_vars_results = temp[0].split(',')[:-1]
+        else:
+            nlp_vars_results = results
+
+        states = self._states
+        controls = self._controls
+        params = self._params
+        m = self._m
+        n = len(states)
+        nu = len(controls)
+        result_list = (list(states) + list(controls)) * m + list(params)
+        store_list = {}
+        for r in (list(states) + list(controls) + list(params)):
+            store_list[r] = []
+        for i in range(len(result_list)):
+            store_list[result_list[i]] += [float(nlp_vars_results[i])]
+
+        t = Matrix(self._t_points)
+        if len(params) > 0:
+            t = t.subs(dict(zip(params, nlp_vars_results[-len(params):])))
+
+        store_list[self.time] = list(t)
+        self.results = store_list
 
 
 
@@ -1174,10 +1317,10 @@ def pull_out_derivatives(has_derivatives, spacing=""):
 
     out_string = []
     for i in range(len(all_ders)):
-        temp_strs = []
+        temp_str = []
         for j in range(len(temp_args[i])):
-            temp_strs += [spacing + "xtemp[%d] = %s;\n" % (j, ccode(temp_args[i][j]))]
-        temp_str = ["num_diff(&UW_%s, xtemp, %d, %d)" % (str(temp_func[i]), temp_vars[i], len(temp_args[i]))]
+            temp_str += [spacing + "xtemp[%d] = %s;\n" % (j, ccode(temp_args[i][j]))]
+        temp_str += ["num_diff(&UW_%s, xtemp, %d, %d)" % (str(temp_func[i]), temp_vars[i], len(temp_args[i]))]
         out_string += [temp_str]
     max_args = max([len(i) for i in temp_args] + [0])
     return all_ders, out_string, max_args
